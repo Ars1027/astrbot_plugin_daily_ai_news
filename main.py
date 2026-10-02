@@ -38,7 +38,7 @@ SUMMARY_PROMPT = """你是一个专业的 AI 资讯编辑。请将以下 AI 早�
     "astrbot_plugin_daily_ai_news",
     "xx",
     "订阅橘鸦AI日报并进行AI总结",
-    "1.02",
+    "1.03",
     "https://github.com/Ars1027/astrbot_plugin_daily_ai_news",
 )
 class DailyAINewsPlugin(Star):
@@ -58,9 +58,12 @@ class DailyAINewsPlugin(Star):
         # 已推送的日期和链接（分离存储）
         self._sent_dates: Set[str] = set()
         self._sent_links: Set[str] = set()
+        self._sent_targets: Dict[str, Set[str]] = {}
+        self._unresolved_targets: Set[str] = set()
 
         # 文件读写互斥锁
         self._file_lock = asyncio.Lock()
+        self._push_lock = asyncio.Lock()
 
     async def initialize(self):
         """插件初始化：加载持久化数据，启动定时推送任务。"""
@@ -113,9 +116,23 @@ class DailyAINewsPlugin(Star):
         self._cmd_subscriptions.add(umo)
         await self._save_subscriptions()
         yield event.plain_result(
-            "✅ 订阅成功！每日将自动推送 AI 早报总结到本群。\n"
+            "✅ 当前会话订阅成功！每日将自动推送 AI 早报。\n"
+            f"会话标识：{umo}\n"
             "取消订阅请发送 /ainews_unsub"
         )
+
+    @filter.command("ainews_retry")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def cmd_retry(self, event: AstrMessageEvent):
+        """管理员立即补发今天的早报到所有订阅目标，忽略已有推送记录。"""
+        yield event.plain_result("🔄 正在补发今天的 AI 早报到所有订阅目标...")
+        today = datetime.now().strftime("%Y-%m-%d")
+        if await self._try_fetch_and_push(today, force=True):
+            yield event.plain_result("✅ 今天的早报已提交到所有订阅目标。")
+        else:
+            yield event.plain_result(
+                "❌ 补发尚未完成。请检查订阅目标、平台连接和插件日志后重试。"
+            )
 
     @filter.command("ainews_unsub")
     async def cmd_unsubscribe(self, event: AstrMessageEvent):
@@ -159,6 +176,7 @@ class DailyAINewsPlugin(Star):
             f"📋 指令订阅数：{cmd_sub_count}\n"
             f"📋 配置群聊数：{cfg_group_count}\n"
             f"📋 配置私聊数：{cfg_user_count}\n"
+            f"💬 当前会话标识：{event.unified_msg_origin}\n"
             f"📚 已推送日期缓存：{len(self._sent_dates)} 天\n"
             f"📚 已推送文章缓存：{len(self._sent_links)} 篇"
         )
@@ -282,7 +300,6 @@ class DailyAINewsPlugin(Star):
             try:
                 target_hour = self.config.get("push_hour", 8)
                 target_minute = self.config.get("push_minute", 0)
-                poll_interval = self.config.get("rss_poll_interval", 600)
 
                 now = datetime.now()
                 target = now.replace(
@@ -307,28 +324,7 @@ class DailyAINewsPlugin(Star):
                     logger.info(f"今日 ({today}) 已推送过，等待明天")
                     continue
 
-                # 首次尝试获取 RSS
-                pushed = await self._try_fetch_and_push(today)
-                if pushed:
-                    continue
-
-                # RSS 尚未更新，进入轮询模式
-                logger.info(
-                    f"RSS 尚未更新当日 ({today}) 内容，"
-                    f"进入轮询模式（间隔 {poll_interval} 秒）"
-                )
-                while True:
-                    await asyncio.sleep(poll_interval)
-
-                    # 如果已经过了当天，停止轮询
-                    current_date = datetime.now().strftime("%Y-%m-%d")
-                    if current_date != today:
-                        logger.info("已过当天，停止轮询，等待明天定时触发")
-                        break
-
-                    pushed = await self._try_fetch_and_push(today)
-                    if pushed:
-                        break
+                await self._poll_until_sent(today)
 
             except asyncio.CancelledError:
                 logger.info("定时推送任务已取消")
@@ -359,69 +355,86 @@ class DailyAINewsPlugin(Star):
                 return
 
             logger.info(f"启动补偿检查：今日 ({today}) 尚未推送，尝试拉取并推送")
-            await self._try_fetch_and_push(today)
+            await self._poll_until_sent(today)
 
         except Exception as e:
             logger.error(f"启动补偿检查失败: {e}")
 
-    async def _try_fetch_and_push(self, today: str) -> bool:
-        """尝试从 RSS 获取当日文章并推送。返回 True 表示成功推送。"""
+    async def _poll_until_sent(self, today: str):
+        """在当天继续检查 RSS 和重试失败目标，直到所有目标完成。"""
+        while datetime.now().strftime("%Y-%m-%d") == today:
+            if await self._try_fetch_and_push(today):
+                return
+            poll_interval = max(1, int(self.config.get("rss_poll_interval", 600)))
+            logger.info(
+                f"今日 ({today}) 推送尚未完成，{poll_interval} 秒后重试"
+            )
+            await asyncio.sleep(poll_interval)
+
+    async def _try_fetch_and_push(self, today: str, force: bool = False) -> bool:
+        """获取当日文章并推送，返回是否已完成所有目标。"""
         try:
-            article = await self._fetch_rss_latest()
-            if not article:
-                logger.info("RSS 获取失败或无文章")
-                return False
+            async with self._push_lock:
+                article = await self._fetch_rss_latest()
+                if not article:
+                    logger.info("RSS 获取失败或无文章")
+                    return False
 
-            # 解析文章日期
-            article_date = self._parse_article_date(article)
+                article_date = self._parse_article_date(article)
+                if article_date != today:
+                    logger.info(
+                        f"RSS 最新文章日期 ({article_date}) 不是今日 ({today})，继续等待"
+                    )
+                    return False
 
-            # 检查是否是当日文章
-            if article_date != today:
-                logger.info(
-                    f"RSS 最新文章日期 ({article_date}) 不是今日 ({today})，继续等待"
-                )
-                return False
+                if force:
+                    # 显式补发可修复旧版本误记的成功记录；保留其他日期的数据。
+                    self._sent_dates.discard(article_date)
+                    self._sent_links.discard(article["link"])
+                    self._sent_targets.pop(article["link"], None)
+                    await self._save_sent_news()
+                elif article["link"] in self._sent_links:
+                    logger.info(f"该文章已完成推送：{article['link']}")
+                    return True
 
-            # 检查是否已推送过该文章（基于链接去重）
-            if article["link"] in self._sent_links:
-                logger.info(f"该文章已推送过：{article['link']}")
-                return False
-
-            # 获取 AI 总结并推送
-            await self._do_push(article, article_date)
-            return True
+                return await self._do_push(article, article_date)
 
         except Exception as e:
             logger.error(f"尝试获取并推送失败: {e}")
             return False
 
-    async def _do_push(self, article: Dict, article_date: str):
-        """执行一次新闻推送到所有订阅目标。"""
+    async def _do_push(self, article: Dict, article_date: str) -> bool:
+        """向尚未完成的订阅目标推送，检查 Core 的发送结果。"""
         logger.info(f"开始执行每日AI资讯推送: {article['title']}")
 
         text = await self._get_or_create_summary(article, article_date)
         if not text:
             logger.warning("未能生成 AI 总结，跳过本次推送")
-            return
+            return False
 
         # 推送
         targets = self._get_all_targets()
         if not targets:
             logger.info("没有任何推送目标，跳过推送")
-            return
+            return False
 
-        success_count = 0
-        for umo in targets:
+        delivered = self._sent_targets.setdefault(article["link"], set())
+        for umo in sorted(targets - delivered):
             try:
                 chain = MessageChain().message(text)
-                await self.context.send_message(umo, chain)
-                logger.info(f"已推送至: {umo}")
-                success_count += 1
+                sent = await self.context.send_message(umo, chain)
+                if not sent:
+                    logger.warning(f"推送到 {umo} 未提交：未找到匹配的平台")
+                    continue
+                delivered.add(umo)
+                logger.info(f"推送请求已提交至: {umo}")
             except Exception as e:
                 logger.error(f"推送到 {umo} 失败: {e}")
 
-        # 仅在至少一个目标发送成功后才标记已推送
-        if success_count > 0:
+        success_count = len(targets & delivered)
+        target_count = len(targets) + len(self._unresolved_targets)
+        complete = success_count == target_count
+        if complete:
             self._sent_dates.add(article_date)
             self._sent_links.add(article["link"])
             # 裁剪：日期保留最近 30 天，链接保留最近 100 条
@@ -430,12 +443,20 @@ class DailyAINewsPlugin(Star):
                 self._sent_dates = set(sorted_dates[-30:])
             if len(self._sent_links) > 100:
                 self._sent_links = set(list(self._sent_links)[-100:])
-            await self._save_sent_news()
             logger.info(
-                f"每日AI资讯推送完成，成功推送到 {success_count}/{len(targets)} 个目标"
+                f"每日AI资讯推送完成，成功推送到 {success_count}/{target_count} 个目标"
             )
         else:
-            logger.warning("所有推送目标均失败，不标记已推送，后续将重试")
+            logger.warning(
+                f"每日AI资讯推送尚未完成，已提交 {success_count}/{target_count} 个目标，"
+                "后续仅重试未成功的目标"
+            )
+        if not delivered:
+            self._sent_targets.pop(article["link"], None)
+        while len(self._sent_targets) > 100:
+            self._sent_targets.pop(next(iter(self._sent_targets)))
+        await self._save_sent_news()
+        return complete
 
     async def _get_or_create_summary(
         self, article: Dict, article_date: str
@@ -696,32 +717,54 @@ class DailyAINewsPlugin(Star):
     def _get_all_targets(self) -> Set[str]:
         """获取所有推送目标。"""
         targets = set(self._cmd_subscriptions)
-
-        cfg_groups = self._get_config_groups()
-        for group_id in cfg_groups:
-            parts = group_id.split(":")
-            if len(parts) == 2:
-                umo = f"{parts[0]}:GroupMessage:{parts[1]}"
-                targets.add(umo)
-            elif len(parts) == 3:
-                targets.add(group_id)
-            else:
-                umo = f"default:GroupMessage:{group_id}"
-                targets.add(umo)
-
-        cfg_users = self._get_config_users()
-        for user_id in cfg_users:
-            parts = user_id.split(":")
-            if len(parts) == 2:
-                umo = f"{parts[0]}:FriendMessage:{parts[1]}"
-                targets.add(umo)
-            elif len(parts) == 3:
-                targets.add(user_id)
-            else:
-                umo = f"default:FriendMessage:{user_id}"
-                targets.add(umo)
-
+        self._unresolved_targets = set()
+        for entries, message_type in (
+            (self._get_config_groups(), "GroupMessage"),
+            (self._get_config_users(), "FriendMessage"),
+        ):
+            for entry in entries:
+                target = self._resolve_config_target(entry, message_type)
+                if target:
+                    targets.add(target)
+                else:
+                    self._unresolved_targets.add(f"{message_type}:{entry}")
         return targets
+
+    def _resolve_config_target(self, entry: str, message_type: str) -> Optional[str]:
+        """使用实际平台实例 ID 解析配置，保留完整会话的冒号后缀。"""
+        parts = entry.split(":", 2)
+        if len(parts) == 3:
+            if (
+                not parts[0]
+                or parts[1] not in ("GroupMessage", "FriendMessage")
+                or not parts[2]
+            ):
+                logger.warning(f"无效的订阅会话：{entry}")
+                return None
+            return entry
+        if len(parts) == 2:
+            platform_id, session_id = parts
+            if not platform_id or not session_id:
+                logger.warning(f"无效的订阅目标：{entry}")
+                return None
+        else:
+            session_id = entry
+            platform_id = self.config.get("push_platform_id", "").strip()
+            if not platform_id:
+                candidates = {
+                    platform.meta().id
+                    for platform in self.context.platform_manager.platform_insts
+                    if platform.meta().name == "aiocqhttp"
+                }
+                if len(candidates) != 1:
+                    logger.warning(
+                        f"无法为订阅 ID {entry} 唯一确定 QQ 平台："
+                        "请设置 push_platform_id，填写 平台ID:账号或群号，"
+                        "或在目标会话使用 /ainews_sub"
+                    )
+                    return None
+                platform_id = next(iter(candidates))
+        return f"{platform_id}:{message_type}:{session_id}"
 
     # ==================== 持久化（带锁 + 原子写）====================
 
@@ -790,6 +833,10 @@ class DailyAINewsPlugin(Star):
                     else:
                         self._sent_dates = set(data.get("sent_dates", []))
                         self._sent_links = set(data.get("sent_links", []))
+                    self._sent_targets = {
+                        link: set(targets)
+                        for link, targets in data.get("sent_targets", {}).items()
+                    }
                     logger.info(
                         f"已加载 {len(self._sent_dates)} 个已推送日期，"
                         f"{len(self._sent_links)} 个已推送链接"
@@ -798,6 +845,7 @@ class DailyAINewsPlugin(Star):
                 logger.error(f"加载已推送记录失败: {e}")
                 self._sent_dates = set()
                 self._sent_links = set()
+                self._sent_targets = {}
 
     async def _save_sent_news(self):
         """保存已推送记录。"""
@@ -808,6 +856,10 @@ class DailyAINewsPlugin(Star):
                     {
                         "sent_dates": sorted(self._sent_dates),
                         "sent_links": list(self._sent_links),
+                        "sent_targets": {
+                            link: sorted(targets)
+                            for link, targets in self._sent_targets.items()
+                        },
                     },
                 )
             except Exception as e:
