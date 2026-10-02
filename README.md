@@ -4,6 +4,8 @@
 
 通过 RSS 订阅 [橘鸦 AI 日报](https://daily.juya.uk/rss.xml) 获取最新 AI 早报，经 **AI 总结** 后自动推送到 QQ 群 / 私聊。
 
+本仓库 fork 自 [xxofficial/astrbot_plugin_daily_ai_news](https://github.com/xxofficial/astrbot_plugin_daily_ai_news)，修正了 `metadata.yaml` 中版本号的类型，使其满足 AstrBot 4.28.0 的安装元数据校验。
+
 ## ✨ 功能
 
 - 📰 **每日自动推送**：每天定时（默认早 8:00）自动推送最新 AI 资讯
@@ -36,9 +38,9 @@
 
 ## 📦 安装
 
-1. 在 AstrBot 管理面板中搜索 `astrbot_plugin_daily_ai_news` 安装
-2. 或手动将本仓库克隆到 `addons/plugins/` 目录下
-3. 重启 AstrBot 即可生效
+1. 在 AstrBot 管理面板的插件页面点击「安装插件」，选择从 URL 安装。
+2. 填入本仓库链接：`https://github.com/Ars1027/astrbot_plugin_daily_ai_news`。
+3. 安装完成后，在目标群或私聊发送 `/ainews` 测试获取，再发送 `/ainews_sub` 订阅每日推送。
 
 ## 📌 注意事项
 

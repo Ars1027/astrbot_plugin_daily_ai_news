@@ -39,7 +39,7 @@ SUMMARY_PROMPT = """你是一个专业的 AI 资讯编辑。请将以下 AI 早�
     "xx",
     "订阅橘鸦AI日报并进行AI总结",
     "1.02",
-    "https://github.com/xxofficial/astrbot_plugin_daily_ai_news",
+    "https://github.com/Ars1027/astrbot_plugin_daily_ai_news",
 )
 class DailyAINewsPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
